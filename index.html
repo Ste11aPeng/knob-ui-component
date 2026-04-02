@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Knob</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    background: #F5F5F5;
+    font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif;
+    user-select: none;
+    -webkit-user-select: none;
+    overflow: hidden;
+  }
+
+  .knob {
+    position: relative;
+    width: 320px;
+    height: 320px;
+    cursor: grab;
+  }
+  .knob.dragging { cursor: grabbing; }
+
+  /* Outer ring */
+  .knob-ring {
+    position: absolute;
+    inset: 0;
+    border-radius: 50%;
+    border: 1px solid rgba(0,0,0,0.04);
+  }
+
+  /* Ticks SVG */
+  .knob-ticks {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 2;
+  }
+  .knob-ticks svg { width: 100%; height: 100%; }
+
+  /* Inner raised face */
+  .knob-face {
+    position: absolute;
+    inset: 32px;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow:
+      0 2px 16px rgba(0,0,0,0.08),
+      0 6px 30px rgba(0,0,0,0.04);
+    z-index: 1;
+  }
+
+  /* ---- Rolling number display ---- */
+  .knob-value {
+    position: absolute;
+    inset: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0;
+    pointer-events: none;
+    z-index: 3;
+  }
+
+  .digit-col {
+    display: inline-block;
+    height: 100px;
+    overflow: visible;
+    position: relative;
+    -webkit-mask-image: linear-gradient(
+      to bottom,
+      transparent 0%,
+      rgba(0,0,0,1) 30%,
+      rgba(0,0,0,1) 70%,
+      transparent 100%
+    );
+    mask-image: linear-gradient(
+      to bottom,
+      transparent 0%,
+      rgba(0,0,0,1) 30%,
+      rgba(0,0,0,1) 70%,
+      transparent 100%
+    );
+  }
+
+  .digit-strip {
+    display: flex;
+    flex-direction: column;
+    will-change: transform;
+  }
+
+  .digit-char {
+    height: 80px;
+    line-height: 80px;
+    font-size: 68px;
+    font-weight: 300;
+    color: #aaa;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -2px;
+    width: 42px;
+    flex-shrink: 0;
+  }
+
+  /* Vertical motion blur via SVG filter */
+  .digit-col {
+    filter: url(#vblur);
+  }
+
+  /* Snap feedback pulse */
+  @keyframes snap-pulse {
+    0%   { transform: scale(1); }
+    40%  { transform: scale(1.06); }
+    100% { transform: scale(1); }
+  }
+  .knob-value.snap {
+    animation: snap-pulse 0.25s ease-out;
+  }
+</style>
+</head>
+<body>
+
+<!-- SVG filter for vertical-only motion blur -->
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <filter id="vblur">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="0 0" />
+    </filter>
+  </defs>
+</svg>
+
+<div class="knob" id="knob">
+  <div class="knob-ring"></div>
+  <div class="knob-ticks"><svg viewBox="0 0 320 320" id="ticksSvg"></svg></div>
+  <div class="knob-face"></div>
+  <div class="knob-value" id="valueContainer"></div>
+</div>
+
+<script>
+(() => {
+  const knobEl  = document.getElementById('knob');
+  const svgEl   = document.getElementById('ticksSvg');
+  const valueCt = document.getElementById('valueContainer');
+  const ns = 'http://www.w3.org/2000/svg';
+
+  const CX = 160, CY = 160;
+  const MIN_VAL = 0, MAX_VAL = 100;
+  const TOTAL_TICKS = 80;        // ticks around full 360°
+  const START_ANGLE = 0;         // full circle ticks
+  const END_ANGLE   = 360;
+
+  // Interactive arc: 0 at top (12 o'clock), clockwise 340°
+  // Dead zone: 20° gap just left of 12 o'clock (340°→360°)
+  const ARC_START = 0, ARC_END = 340, ARC_RANGE = 340;
+
+  const R_TICK_OUT = 144, R_TICK_IN = 133, R_INDICATOR = 126;
+
+  // Snap points & threshold
+  const SNAP_POINTS = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+  const SNAP_THRESHOLD = 3;   // within ±3 → snap
+  const SNAP_STRENGTH  = 0.4; // extra pull toward snap
+
+  let targetValue  = 0;
+  let displayValue = 0;
+  let velocity     = 0;
+  let isDragging   = false;
+  let animFrame    = null;
+  let lastSnapVal  = null;
+
+  /* ========== Rolling digit columns ========== */
+  const digitCols = [];  // { el, strip }
+  const blurFilter = document.querySelector('#vblur feGaussianBlur');
+
+  function buildDigitCol() {
+    const col = document.createElement('div');
+    col.className = 'digit-col';
+    const strip = document.createElement('div');
+    strip.className = 'digit-strip';
+    // 0-9 + duplicate 0 at end for seamless wrap
+    for (let d = 0; d <= 10; d++) {
+      const ch = document.createElement('div');
+      ch.className = 'digit-char';
+      ch.textContent = d % 10;
+      strip.appendChild(ch);
+    }
+    col.appendChild(strip);
+    return { el: col, strip };
+  }
+
+  function ensureColumns(n) {
+    while (digitCols.length < n) {
+      const col = buildDigitCol();
+      digitCols.push(col);
+      valueCt.appendChild(col.el);
+    }
+    while (digitCols.length > n) {
+      const removed = digitCols.pop();
+      valueCt.removeChild(removed.el);
+    }
+  }
+
+  /* Odometer-style: each digit rolls smoothly,
+     higher digits only roll when the digit below wraps 9→0 */
+  function getContinuousDigitOffset(val, place) {
+    // Continuous position for this digit place
+    const divisor = Math.pow(10, place);
+    const continuous = (val / divisor) % 10;
+
+    if (place === 0) return continuous;
+
+    // For higher places: only roll near the 9→0 transition
+    const base = Math.floor(continuous);
+    const belowContinuous = (val / Math.pow(10, place - 1)) % 10;
+
+    // When the digit below is in [9, 10), start rolling this digit
+    if (belowContinuous >= 9) {
+      const rollFrac = belowContinuous - 9; // 0→1
+      return base + rollFrac;
+    }
+    return base;
+  }
+
+  function setRollingValue(val, speed) {
+    const clamped = Math.max(0, Math.min(MAX_VAL, val));
+    const numDigits = clamped >= 100 ? 3 : clamped >= 10 ? 2 : 1;
+    ensureColumns(numDigits);
+
+    for (let i = 0; i < numDigits; i++) {
+      const place = numDigits - 1 - i; // leftmost = highest place
+      const offset = getContinuousDigitOffset(clamped, place);
+      digitCols[i].strip.style.transform = `translateY(${-offset * 80}px)`;
+    }
+
+    // Update vertical motion blur based on speed
+    const blurAmt = Math.min(speed * 4, 8);
+    blurFilter.setAttribute('stdDeviation', `0 ${blurAmt.toFixed(2)}`);
+  }
+
+  /* ========== SVG ticks (full 360°) + indicator ========== */
+  function buildTicks() {
+    for (let i = 0; i < TOTAL_TICKS; i++) {
+      const angle = (i / TOTAL_TICKS) * 360;
+      const rad = (angle - 90) * Math.PI / 180;
+
+      const line = document.createElementNS(ns, 'line');
+      line.setAttribute('x1', CX + R_TICK_OUT * Math.cos(rad));
+      line.setAttribute('y1', CY + R_TICK_OUT * Math.sin(rad));
+      line.setAttribute('x2', CX + R_TICK_IN  * Math.cos(rad));
+      line.setAttribute('y2', CY + R_TICK_IN  * Math.sin(rad));
+      line.setAttribute('stroke', '#e0e0e0');
+      line.setAttribute('stroke-width', '1.5');
+      line.setAttribute('stroke-linecap', 'round');
+      line.classList.add('tick');
+      svgEl.appendChild(line);
+    }
+
+    // Needle indicator — sleek teardrop path
+    const indicator = document.createElementNS(ns, 'path');
+    indicator.setAttribute('id', 'indicator');
+    indicator.setAttribute('fill', '#bbb');
+    svgEl.appendChild(indicator);
+  }
+
+  function indicatorPath(angle) {
+    const rad  = (angle - 90) * Math.PI / 180;
+    const perp = rad + Math.PI / 2;
+
+    // Tip: sharp point outward
+    const tipR = R_INDICATOR + 12;
+    const tx = CX + tipR * Math.cos(rad);
+    const ty = CY + tipR * Math.sin(rad);
+
+    // Rounded base (two sides + arc)
+    const baseR = R_INDICATOR - 2;
+    const bw = 3.5;
+    const b1x = CX + baseR * Math.cos(rad) + bw * Math.cos(perp);
+    const b1y = CY + baseR * Math.sin(rad) + bw * Math.sin(perp);
+    const b2x = CX + baseR * Math.cos(rad) - bw * Math.cos(perp);
+    const b2y = CY + baseR * Math.sin(rad) - bw * Math.sin(perp);
+
+    // Control points for smooth curves from tip to base
+    const midR = R_INDICATOR + 4;
+    const cw = 2.5;
+    const c1x = CX + midR * Math.cos(rad) + cw * Math.cos(perp);
+    const c1y = CY + midR * Math.sin(rad) + cw * Math.sin(perp);
+    const c2x = CX + midR * Math.cos(rad) - cw * Math.cos(perp);
+    const c2y = CY + midR * Math.sin(rad) - cw * Math.sin(perp);
+
+    return `M${tx},${ty} Q${c1x},${c1y} ${b1x},${b1y} A${bw},${bw} 0 0,1 ${b2x},${b2y} Q${c2x},${c2y} ${tx},${ty}Z`;
+  }
+
+  /* Map a value to an angle on the interactive arc */
+  function valToAngle(v) {
+    const frac = (v - MIN_VAL) / (MAX_VAL - MIN_VAL);
+    return ARC_START + frac * ARC_RANGE;
+  }
+
+  /* Map an interactive-arc angle to a tick index (full 360° ring) */
+  function angleToTickIndex(angleDeg) {
+    let a = angleDeg % 360;
+    if (a < 0) a += 360;
+    return Math.round((a / 360) * TOTAL_TICKS) % TOTAL_TICKS;
+  }
+
+  function updateUI(val) {
+    const frac   = (val - MIN_VAL) / (MAX_VAL - MIN_VAL);
+    const angle  = valToAngle(val);
+
+    // Which tick indices should be "active" (from arc start to current angle)?
+    const startIdx = angleToTickIndex(ARC_START);
+    const curIdx   = angleToTickIndex(angle);
+
+    const ticks = svgEl.querySelectorAll('.tick');
+    for (let i = 0; i < ticks.length; i++) {
+      let active = false;
+      // The active range wraps around if needed
+      if (startIdx <= curIdx) {
+        active = i >= startIdx && i <= curIdx;
+      } else {
+        active = i >= startIdx || i <= curIdx;
+      }
+      ticks[i].setAttribute('stroke', active ? '#aaa' : '#e0e0e0');
+      ticks[i].setAttribute('stroke-width', active ? '2' : '1.5');
+    }
+
+    // Indicator
+    document.getElementById('indicator').setAttribute('d', indicatorPath(angle));
+
+    // Rolling digits (speed passed separately)
+    setRollingValue(val, Math.abs(velocity));
+  }
+
+  /* ========== Snap logic ========== */
+  function nearestSnap(val) {
+    let best = null, bestDist = Infinity;
+    for (const sp of SNAP_POINTS) {
+      const d = Math.abs(val - sp);
+      if (d < bestDist) { bestDist = d; best = sp; }
+    }
+    return bestDist <= SNAP_THRESHOLD ? best : null;
+  }
+
+  function triggerSnapFeedback() {
+    valueCt.classList.remove('snap');
+    void valueCt.offsetWidth; // reflow to restart animation
+    valueCt.classList.add('snap');
+  }
+
+  /* ========== Spring-based animation ========== */
+  const SPRING_STIFFNESS = 0.015;
+  const SPRING_DAMPING   = 0.92;
+
+  function animate() {
+    let target = targetValue;
+
+    // If not dragging, apply snap attraction
+    if (!isDragging) {
+      const snap = nearestSnap(target);
+      if (snap !== null) {
+        target = snap;
+      }
+    }
+
+    // Spring physics
+    const force = (target - displayValue) * SPRING_STIFFNESS;
+    velocity = (velocity + force) * SPRING_DAMPING;
+    displayValue += velocity;
+
+    // Snap feedback
+    const roundedDisplay = Math.round(displayValue);
+    const snapPt = nearestSnap(roundedDisplay);
+    if (snapPt !== null && snapPt === roundedDisplay && lastSnapVal !== snapPt) {
+      lastSnapVal = snapPt;
+      if (!isDragging) triggerSnapFeedback();
+    }
+    if (snapPt === null || snapPt !== roundedDisplay) {
+      lastSnapVal = null;
+    }
+
+    // Check convergence
+    if (Math.abs(velocity) > 0.01 || Math.abs(target - displayValue) > 0.05) {
+      updateUI(displayValue);
+      animFrame = requestAnimationFrame(animate);
+    } else {
+      displayValue = target;
+      updateUI(displayValue);
+      animFrame = null;
+    }
+  }
+
+  function setTarget(val) {
+    targetValue = Math.max(MIN_VAL, Math.min(MAX_VAL, val));
+    if (!animFrame) animFrame = requestAnimationFrame(animate);
+  }
+
+  /* ========== Pointer → value ========== */
+  function pointerToValue(clientX, clientY) {
+    const rect = knobEl.getBoundingClientRect();
+    const dx = clientX - (rect.left + rect.width / 2);
+    const dy = clientY - (rect.top  + rect.height / 2);
+
+    // angle: 0° = top (12 o'clock), clockwise positive
+    let angle = Math.atan2(dy, dx) * (180 / Math.PI) + 90;
+    if (angle < 0) angle += 360; // normalize to 0-360
+
+    // Dead zone: 340° to 360° (just left of 12 o'clock)
+    if (angle > ARC_END) {
+      // Which end is closer?
+      const dToEnd = angle - ARC_END;        // distance to 100 side
+      const dToStart = 360 - angle;          // distance to 0 side
+      angle = dToStart < dToEnd ? ARC_START : ARC_END;
+    }
+
+    let val = MIN_VAL + ((angle - ARC_START) / ARC_RANGE) * (MAX_VAL - MIN_VAL);
+
+    // While dragging, add gentle snap attraction
+    const snap = nearestSnap(val);
+    if (snap !== null) {
+      const pull = (snap - val) * SNAP_STRENGTH;
+      val += pull;
+    }
+
+    return val;
+  }
+
+  /* ========== Events ========== */
+  knobEl.addEventListener('pointerdown', e => {
+    isDragging = true;
+    knobEl.classList.add('dragging');
+    knobEl.setPointerCapture(e.pointerId);
+    setTarget(pointerToValue(e.clientX, e.clientY));
+  });
+
+  knobEl.addEventListener('pointermove', e => {
+    if (!isDragging) return;
+    setTarget(pointerToValue(e.clientX, e.clientY));
+  });
+
+  const stopDrag = () => {
+    isDragging = false;
+    knobEl.classList.remove('dragging');
+    // On release, snap to nearest if close
+    const snap = nearestSnap(targetValue);
+    if (snap !== null) {
+      targetValue = snap;
+      triggerSnapFeedback();
+    }
+    if (!animFrame) animFrame = requestAnimationFrame(animate);
+  };
+  knobEl.addEventListener('pointerup', stopDrag);
+  knobEl.addEventListener('pointercancel', stopDrag);
+
+  // Init
+  buildTicks();
+  updateUI(displayValue);
+})();
+</script>
+</body>
+</html>
