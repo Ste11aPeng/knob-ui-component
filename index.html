@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Knob</title>
+<title>Knob UI By SP</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -26,6 +26,22 @@
     cursor: grab;
   }
   .knob.dragging { cursor: grabbing; }
+
+  .credit {
+    position: fixed;
+    bottom: 20px;
+    left: 24px;
+    font-size: 13px;
+    color: #bbb;
+    letter-spacing: 0.02em;
+  }
+  .credit a {
+    color: #999;
+    text-decoration: none;
+  }
+  .credit a:hover {
+    color: #666;
+  }
 
   /* Outer ring */
   .knob-ring {
@@ -141,6 +157,8 @@
   <div class="knob-face"></div>
   <div class="knob-value" id="valueContainer"></div>
 </div>
+
+<div class="credit">Designed by <a href="https://ruocanpeng.com/" target="_blank">Stella P</a></div>
 
 <script>
 (() => {
